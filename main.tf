@@ -1,4 +1,4 @@
-Based on the provided architecture diagram and configuration details, here's the Terraform code to create the infrastructure:
+Based on the architecture diagram and the provided configuration, here's the Terraform code to create the infrastructure:
 
 ```hcl
 provider "aws" {
@@ -7,31 +7,52 @@ provider "aws" {
 
 resource "aws_vpc" "main" {
   cidr_block = "10.0.0.0/16"
-  
+
   tags = {
-    Name = "main-vpc"
+    Name = "Main VPC"
   }
 }
 
 resource "aws_subnet" "main" {
-  vpc_id     = aws_vpc.main.id
-  cidr_block = "10.0.1.0/24"
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "us-west-2a"
 
   tags = {
-    Name = "main-subnet"
+    Name = "Main Subnet"
   }
 }
 
-resource "aws_security_group" "rds" {
-  name        = "rds-sg"
-  description = "Security group for RDS"
+resource "aws_security_group" "ec2_sg" {
+  name        = "ec2-security-group"
+  description = "Security group for EC2 instances"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    from_port   = 5432
-    to_port     = 5432
+    from_port   = 22
+    to_port     = 22
     protocol    = "tcp"
-    security_groups = [aws_security_group.ec2.id]
+    cidr_blocks = ["10.0.0.0/16"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "rds_sg" {
+  name        = "rds-security-group"
+  description = "Security group for RDS instance"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2_sg.id]
   }
 
   egress {
@@ -43,107 +64,94 @@ resource "aws_security_group" "rds" {
 }
 
 resource "aws_db_instance" "main" {
-  engine               = "postgres"
-  engine_version       = "17.0"
-  instance_class       = "db.m5.xlarge"
-  allocated_storage    = 20
-  storage_type         = "gp2"
-  identifier           = "main-db"
-  username             = "admin"
-  password             = "password"
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  multi_az             = false
+  engine                 = "postgres"
+  engine_version         = "17.0"
+  instance_class         = "db.m5.xlarge"
+  multi_az               = false
   backup_retention_period = 1
-  skip_final_snapshot  = true
-  subnet_id            = aws_subnet.main.id
-}
+  storage_encrypted      = false
+  vpc_security_group_ids = [aws_security_group.rds_sg.id]
+  subnet_id              = aws_subnet.main.id
 
-resource "aws_security_group" "ec2" {
-  name        = "ec2-sg"
-  description = "Security group for EC2 instances"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # Add other necessary configurations like allocated_storage, db_name, username, password, etc.
 }
 
 resource "aws_launch_template" "main" {
-  name_prefix   = "main-lt-"
-  image_id      = "ami-0c55b159cbfafe1f0"  # Amazon Linux 2 AMI ID
+  name_prefix   = "ec2-launch-template"
+  image_id      = "ami-xxxxxxxx"  # Replace with actual Amazon Linux 2 AMI ID for us-west-2
   instance_type = "t2.micro"
 
-  vpc_security_group_ids = [aws_security_group.ec2.id]
+  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
 
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name = "main-instance"
-    }
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2_profile.name
   }
+
+  # Add other necessary configurations
 }
 
 resource "aws_autoscaling_group" "main" {
-  desired_capacity   = 2
-  max_size           = 3
-  min_size           = 2
+  name                = "ec2-asg"
+  min_size            = 2
+  max_size            = 3
+  desired_capacity    = 2
   vpc_zone_identifier = [aws_subnet.main.id]
 
   launch_template {
     id      = aws_launch_template.main.id
     version = "$Latest"
   }
+
+  # Add other necessary configurations
 }
 
-resource "aws_lb" "main" {
-  name               = "main-lb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.ec2.id]
-  subnets            = [aws_subnet.main.id]
+resource "aws_iam_role" "ec2_role" {
+  name = "EC2RDSAccessRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
 }
 
-resource "aws_lb_target_group" "main" {
-  name     = "main-tg"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.main.id
+resource "aws_iam_role_policy" "ec2_rds_access" {
+  name = "EC2RDSAccessPolicy"
+  role = aws_iam_role.ec2_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "rds:*"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
 
-resource "aws_lb_listener" "main" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = "80"
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.main.arn
-  }
-}
-
-resource "aws_autoscaling_attachment" "main" {
-  autoscaling_group_name = aws_autoscaling_group.main.id
-  alb_target_group_arn   = aws_lb_target_group.main.arn
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "EC2RDSAccessProfile"
+  role = aws_iam_role.ec2_role.name
 }
 ```
 
-This Terraform code creates the following resources based on the provided architecture diagram and configuration:
+This Terraform code creates the infrastructure based on the provided architecture diagram and configuration. It includes:
 
-1. A VPC with one subnet
-2. An RDS PostgreSQL instance with specified configuration
-3. EC2 instances managed by an Auto Scaling Group
-4. Security groups for RDS and EC2 instances
-5. A launch template for EC2 instances
-6. An Application Load Balancer with a target group and listener
+1. A VPC with a subnet
+2. Security groups for EC2 and RDS
+3. An RDS instance
+4. An EC2 launch template and Auto Scaling Group
+5. IAM role and instance profile for EC2 instances to access RDS
 
-Note that you may need to adjust some values, such as the AMI ID, to match your specific requirements and region.
+Note that you may need to adjust some values (like the AMI ID) and add additional configurations as needed for your specific use case.
