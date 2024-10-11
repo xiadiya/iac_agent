@@ -1,4 +1,4 @@
-Based on the architecture diagram and the provided JSON configuration, here's the Terraform code to create the infrastructure:
+Here's the Terraform code based on the provided architecture diagram and specifications:
 
 ```hcl
 provider "aws" {
@@ -6,33 +6,33 @@ provider "aws" {
 }
 
 module "vpc" {
-  source = "terraform-aws-modules/vpc/aws"
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 3.0"
 
-  name = "my-vpc"
+  name = "main-vpc"
   cidr = "10.0.0.0/16"
 
-  azs             = ["us-west-2a", "us-west-2b"]
+  azs             = ["us-west-2a"]
   private_subnets = ["10.0.1.0/24"]
-  public_subnets  = ["10.0.101.0/24"]
 
-  enable_nat_gateway = true
-  single_nat_gateway = true
+  enable_nat_gateway = false
   enable_vpn_gateway = false
 
   tags = {
-    Terraform = "true"
+    Terraform   = "true"
     Environment = "dev"
   }
 }
 
 resource "aws_security_group" "rds_sg" {
   name        = "rds-security-group"
-  description = "Security group for RDS"
+  description = "Security group for RDS instance"
   vpc_id      = module.vpc.vpc_id
 
   ingress {
-    from_port       = 34
-    to_port         = 34
+    description     = "Allow inbound from EC2"
+    from_port       = 5432
+    to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.ec2_sg.id]
   }
@@ -51,17 +51,11 @@ resource "aws_security_group" "ec2_sg" {
   vpc_id      = module.vpc.vpc_id
 
   ingress {
+    description = "Allow SSH from VPC"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 40
-    to_port     = 40
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [module.vpc.vpc_cidr_block]
   }
 
   egress {
@@ -72,30 +66,72 @@ resource "aws_security_group" "ec2_sg" {
   }
 }
 
-resource "aws_db_instance" "rds_instance" {
-  engine               = "postgres"
-  engine_version       = "17.0"
-  instance_class       = "db.m5.xlarge"
-  allocated_storage    = 20
-  storage_type         = "gp2"
-  identifier           = "mydb"
-  username             = "admin"
-  password             = "password"
+module "rds" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "~> 3.0"
+
+  identifier = "mydb"
+
+  engine            = "postgres"
+  engine_version    = "17.0"
+  instance_class    = "db.m5.xlarge"
+  allocated_storage = 200
+
+  db_name  = "mydb"
+  username = "user"
+  password = "YourPwdShouldBeDynamic!"
+
   vpc_security_group_ids = [aws_security_group.rds_sg.id]
-  db_subnet_group_name = aws_db_subnet_group.rds_subnet_group.name
-  multi_az             = false
-  backup_retention_period = 1
-  backup_window        = "03:00-04:00"
-  maintenance_window   = "sun:04:00-sun:05:00"
+
+  maintenance_window = "Mon:00:00-Mon:03:00"
+  backup_window      = "03:00-06:00"
+
+  # DB subnet group
+  subnet_ids = module.vpc.private_subnets
+
+  # DB parameter group
+  family = "postgres17"
+
+  # DB option group
+  major_engine_version = "17"
+
+  # Database Deletion Protection
+  deletion_protection = false
+
+  parameters = [
+    {
+      name  = "autovacuum"
+      value = 1
+    }
+  ]
+
+  tags = {
+    Environment = "dev"
+    Terraform   = "true"
+  }
 }
 
-resource "aws_db_subnet_group" "rds_subnet_group" {
-  name       = "rds-subnet-group"
-  subnet_ids = module.vpc.private_subnets
+module "ec2_instance" {
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "~> 3.0"
+
+  name = "single-instance"
+
+  ami                    = "ami-0c55b159cbfafe1f0"
+  instance_type          = "t2.micro"
+  key_name               = "user1"
+  monitoring             = true
+  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+  subnet_id              = module.vpc.private_subnets[0]
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+  }
 }
 
 resource "aws_iam_role" "ec2_role" {
-  name = "ec2-role"
+  name = "ec2_role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -111,48 +147,36 @@ resource "aws_iam_role" "ec2_role" {
   })
 }
 
+resource "aws_iam_role_policy" "rds_access" {
+  name = "rds_access"
+  role = aws_iam_role.ec2_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "rds:*",
+        ]
+        Effect   = "Allow"
+        Resource = module.rds.db_instance_arn
+      },
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "ec2-profile"
+  name = "ec2_profile"
   role = aws_iam_role.ec2_role.name
-}
-
-resource "aws_launch_template" "ec2_launch_template" {
-  name_prefix   = "ec2-launch-template"
-  image_id      = "ami-xxxxxxxx"
-  instance_type = "t2.micro"
-
-  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
-
-  iam_instance_profile {
-    name = aws_iam_instance_profile.ec2_profile.name
-  }
-
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name = "EC2 Instance"
-    }
-  }
-}
-
-resource "aws_autoscaling_group" "ec2_asg" {
-  name                = "ec2-asg"
-  vpc_zone_identifier = module.vpc.public_subnets
-  min_size            = 2
-  max_size            = 3
-  desired_capacity    = 2
-
-  launch_template {
-    id      = aws_launch_template.ec2_launch_template.id
-    version = "$Latest"
-  }
-}
-
-resource "aws_eip" "ec2_eip" {
-  count    = 2
-  domain   = "vpc"
-  instance = aws_autoscaling_group.ec2_asg.id
 }
 ```
 
-This Terraform code creates the VPC, security groups, RDS instance, EC2 instances with an Auto Scaling Group, and the necessary IAM roles and profiles based on the provided architecture diagram and JSON configuration. Note that you'll need to replace "ami-xxxxxxxx" with an actual AMI ID for your region and desired operating system.
+This Terraform code creates the following resources:
+
+1. A VPC with one private subnet
+2. Security groups for RDS and EC2
+3. An RDS PostgreSQL instance
+4. An EC2 instance
+5. IAM role and policy for EC2 to access RDS
+
+Note that this is a basic implementation and may need further customization based on your specific requirements. Also, remember to handle sensitive information like database passwords securely, preferably using AWS Secrets Manager or similar services.
